@@ -12,6 +12,8 @@ from torch.amp import autocast, GradScaler
 from tqdm.notebook import tqdm  # Progress bar for Jupyter
 from IPython.display import display, clear_output
 import matplotlib.pyplot as plt
+import torch.nn.functional as F
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 
@@ -63,10 +65,21 @@ class GPT2ForClassification(nn.Module):
             nn.Linear(hidden_dim // 4, 1),
         )
 
-    def forward(self, input_ids, attention_mask):
-        outputs = self.gpt.transformer(input_ids, attention_mask=attention_mask)
+    def forward(self, input_ids=None, attention_mask=None, inputs_embeds=None):
+        """
+        Forward pass that supports both tokenized input (input_ids) and raw embeddings (inputs_embeds).
+        """
+        if input_ids is not None and inputs_embeds is not None:
+            raise ValueError("Specify either `input_ids` or `inputs_embeds`, but not both.")
+        
+        if input_ids is not None:
+            outputs = self.gpt.transformer(input_ids=input_ids, attention_mask=attention_mask)
+        else:
+            outputs = self.gpt.transformer(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
+
         last_hidden_state = outputs.last_hidden_state
 
+        # Extract CLS representation (last token's hidden state)
         cls_representation = last_hidden_state[:, -1, :]
 
         cls_representation = self.dropout(cls_representation)
@@ -141,7 +154,7 @@ def train_classifier(model, model_tokenizer, df, text_col, label_col, batch_size
 
 def get_tokenizer_and_model(name='openai-community/gpt2-large'):
     gpt_tokenizer = AutoTokenizer.from_pretrained(name)
-    gpt = GPT2LMHeadModel.from_pretrained("openai-community/gpt2-large")
+    gpt = GPT2LMHeadModel.from_pretrained(name)
     return gpt_tokenizer, gpt
 
 
@@ -164,6 +177,98 @@ def download_dataset(base_path, splits, directory_name):
     print("✅ All datasets saved successfully in 'dataset' directory!")
 
         
+
+class LLMProbabilisticPipeline(nn.Module):
+    def __init__(self, model_name, prompt_length, num_tokens, classifier, learning_rate=1e-2):
+        super().__init__()
+        
+        # Set device
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        # Load model and tokenizer
+        self.tokenizer, self.model = get_tokenizer_and_model(model_name)
+        self.model.to(self.device)  # Move model to device
+
+        self.classifier = classifier  
+        self.prompt_length = prompt_length
+        self.num_tokens = num_tokens  
+        self.vocab_size = self.tokenizer.vocab_size
+        self.embedding_matrix = self.model.get_input_embeddings().weight.to(self.device)  # Ensure embeddings are on device
+
+        # Learnable probability distribution over tokens (Move to device)
+        self.prompt_prob_dist = nn.Parameter(
+            F.gumbel_softmax(torch.randn(prompt_length, self.vocab_size, device=self.device), dim=-1)
+        )
+
+        self.optimizer = torch.optim.Adam([self.prompt_prob_dist], lr=learning_rate)
+
+    def get_weighted_embedding(self, prob_dist):
+        """Computes the weighted sum of embeddings based on probability distributions."""
+        weighted_sum = torch.matmul(prob_dist, self.embedding_matrix)  # (seq_len, emb_dim)
+        # Ensure the output shape remains (batch, seq_len, emb_dim)
+        if len(weighted_sum.shape) == 2:  
+            weighted_sum = weighted_sum.unsqueeze(0)  # Add batch dimension if missing
+
+        return weighted_sum.to(self.device)  # Ensure tensor is on the correct device
+
+    def generate_response(self, prompt_prob_dist):
+        """Generates a response while storing probability distributions at each step."""
+        self.model.to(self.device)  # Ensure model is on device
+        prompt_prob_dist = prompt_prob_dist.to(self.device)  # Move prompt distribution to device
+
+        # Convert probability distribution into a prompt embedding
+        weighted_prompt = self.get_weighted_embedding(prompt_prob_dist)
+        attention_mask = torch.ones(weighted_prompt.shape[:2], device=self.device)
+        # Run model generation with proper settings
+        output = self.model.generate(
+            inputs_embeds=weighted_prompt,
+            attention_mask=attention_mask, 
+            max_length=self.num_tokens, 
+            pad_token_id=self.tokenizer.eos_token_id,
+            do_sample=True, 
+            temperature=1.0, 
+            return_dict_in_generate=True,  
+            output_scores=True  
+        )
+
+        # Extract generated tokens
+        generated_tokens = output.sequences.to(self.device)
+        generated_text = self.tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
+
+        # Extract logits per step and convert to probabilities
+        logits_per_step = [logits.to(self.device) for logits in output.scores]  # Move logits to device
+        probabilities_per_step = [F.gumbel_softmax(logits, dim=-1) for logits in logits_per_step]
+        all_probs_tensor = torch.stack(probabilities_per_step, dim=1).to(self.device)  # (1, num_tokens, vocab_size)
+
+        return generated_text, all_probs_tensor
+
+    def forward(self):
+        """Computes safety score based on generated responses."""
+        _, prob_matrix = self.generate_response(self.prompt_prob_dist)
+        
+        # Generate the corresponding attention mask
+        attention_mask = torch.ones(prob_matrix.shape[:2], device=self.device)  # (1, num_tokens)
+        
+        # Pass both `inputs_embeds` and `attention_mask` to the classifier
+        input_embedding = self.get_weighted_embedding(prob_matrix)  # (1, seq_len, emb_dim)
+        safety_logit = self.classifier(attention_mask=attention_mask, inputs_embeds=input_embedding).squeeze(-1)  # (1, num_tokens, 1)
+        # get safety score for backpropagation from a single logit using sigmoid
+        safety_score = torch.sigmoid(safety_logit)
+        return safety_score
+
+    def train_step(self):
+        """Performs a training step to optimize the prompt distribution."""
+        self.optimizer.zero_grad()
+        safety_score = self.forward()
+        loss = safety_score  
+        loss.backward()
+        self.optimizer.step()
+        return loss.item()
+
+
+
+
+
         
 
 
