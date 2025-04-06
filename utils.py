@@ -212,39 +212,68 @@ class LLMProbabilisticPipeline(nn.Module):
         return weighted_sum.to(self.device)  # Ensure tensor is on the correct device
 
     def generate_response(self, prompt_prob_dist):
-        """Generates a response while storing probability distributions at each step."""
+        """Generates a response step by step while applying Gumbel-Softmax to logits at each step.
+        Concatenates the token probabilities to the current sequence."""
+        
         self.model.to(self.device)  # Ensure model is on device
         prompt_prob_dist = prompt_prob_dist.to(self.device)  # Move prompt distribution to device
 
-        # Convert probability distribution into a prompt embedding
+        # Initialize the prompt with the weighted embedding of the initial probability distribution
         weighted_prompt = self.get_weighted_embedding(prompt_prob_dist)
-        attention_mask = torch.ones(weighted_prompt.shape[:2], device=self.device)
-        # Run model generation with proper settings
-        output = self.model.generate(
-            inputs_embeds=weighted_prompt,
-            attention_mask=attention_mask, 
-            max_length=self.num_tokens, 
-            pad_token_id=self.tokenizer.eos_token_id,
-            do_sample=True, 
-            temperature=1.0, 
-            return_dict_in_generate=True,  
-            output_scores=True  
-        )
+        attention_mask = torch.ones(weighted_prompt.shape[:2], device=self.device)  # Mask for attention
+        
+        generated_tokens = []  # To store the generated sequence (tokens)
+        generated_probs = []   # To store the probability distributions of each generated token
+        
+        # Initial input embeddings for the first token
+        input_embedding = weighted_prompt
+        current_sequence = prompt_prob_dist.unsqueeze(0)  # Start with the initial prompt distribution
+        
+        for step in range(self.num_tokens):
+            # Get logits for the next token
+            output = self.model(inputs_embeds=input_embedding, 
+                                attention_mask=attention_mask, 
+                                use_cache=True)  # No sampling, just the logits
+            
+            # Extract logits for the current step (this is for the next token)
+            logits = output.logits[:, -1, :]  # Get logits for the last token (current step)
 
-        # Extract generated tokens
-        generated_tokens = output.sequences.to(self.device)
-        generated_text = self.tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
+            # Apply Gumbel Softmax to get the next token probabilities
+            token_probs = F.gumbel_softmax(logits, tau=1.0, dim=-1)
+            
+            # Append token probabilities to the generated probabilities
+            generated_probs.append(token_probs.squeeze(0))  # Add the current token probabilities
 
-        # Extract logits per step and convert to probabilities
-        logits_per_step = [logits.to(self.device) for logits in output.scores]  # Move logits to device
-        probabilities_per_step = [F.gumbel_softmax(logits, dim=-1) for logits in logits_per_step]
-        all_probs_tensor = torch.stack(probabilities_per_step, dim=1).to(self.device)  # (1, num_tokens, vocab_size)
+            # Sample the next token based on the probabilities (for continuity)
+            next_token = token_probs.argmax(dim=-1).unsqueeze(-1)  # Get the token with highest probability
+            
+            # Append the next token to the generated sequence (tokens)
+            generated_tokens.append(next_token.item())
 
-        return generated_text, all_probs_tensor
+            # Update the current sequence by appending the next token's probability distribution
+            next_token_prob_dist = token_probs.unsqueeze(0)  # Add batch dimension
+            current_sequence = torch.cat((current_sequence, next_token_prob_dist), dim=1)
+
+            # Update input embedding with the newly generated token using get_weighted_embedding
+            input_embedding = torch.cat(
+                (input_embedding, self.get_weighted_embedding(token_probs.unsqueeze(0))), dim=1
+            )  # Concatenate the new token's weighted embedding to the sequence
+        
+            
+            # Update the attention mask
+            attention_mask = torch.cat((attention_mask, torch.ones(1, 1, device=self.device)), dim=1)  # Append 1 to attention mask
+
+        # Decode the generated sequence into text (using token IDs)
+        generated_text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+
+        # Convert the list of probabilities into a tensor for further analysis or saving
+        generated_probs_tensor = torch.stack(generated_probs, dim=0).to(self.device)  # (1, num_tokens, vocab_size)
+
+        return generated_text, generated_tokens, generated_probs_tensor
 
     def forward(self):
         """Computes safety score based on generated responses."""
-        _, prob_matrix = self.generate_response(self.prompt_prob_dist)
+        _, _, prob_matrix = self.generate_response(self.prompt_prob_dist)
         
         # Generate the corresponding attention mask
         attention_mask = torch.ones(prob_matrix.shape[:2], device=self.device)  # (1, num_tokens)
