@@ -188,17 +188,24 @@ class LLMProbabilisticPipeline(nn.Module):
         # Load model and tokenizer
         self.tokenizer, self.model = get_tokenizer_and_model(model_name)
         self.model.to(self.device)  # Move model to device
-
         self.classifier = classifier  
         self.prompt_length = prompt_length
         self.num_tokens = num_tokens  
         self.vocab_size = self.tokenizer.vocab_size
-        self.embedding_matrix = self.model.get_input_embeddings().weight.to(self.device)  # Ensure embeddings are on device
-
+        self.embedding_layer = self.model.get_input_embeddings()
+        self.embedding_layer.weight.requires_grad = False
+        self.embedding_matrix = self.embedding_layer.weight.to(self.device)
         # Learnable probability distribution over tokens (Move to device)
         self.prompt_prob_dist = nn.Parameter(
             F.gumbel_softmax(torch.randn(prompt_length, self.vocab_size, device=self.device), dim=-1)
         )
+        
+        for param in self.model.parameters():
+            param.requires_grad = False
+
+        # Freeze classifier parameters
+        for param in self.classifier.parameters():
+            param.requires_grad = False
 
         self.optimizer = torch.optim.Adam([self.prompt_prob_dist], lr=learning_rate)
 
@@ -220,79 +227,135 @@ class LLMProbabilisticPipeline(nn.Module):
 
         # Initialize the prompt with the weighted embedding of the initial probability distribution
         weighted_prompt = self.get_weighted_embedding(prompt_prob_dist)
+        print("initial weighted_prompt grad_fn:", weighted_prompt.grad_fn)
         attention_mask = torch.ones(weighted_prompt.shape[:2], device=self.device)  # Mask for attention
         
-        generated_tokens = []  # To store the generated sequence (tokens)
-        generated_probs = []   # To store the probability distributions of each generated token
+
         
         # Initial input embeddings for the first token
         input_embedding = weighted_prompt
-        current_sequence = prompt_prob_dist.unsqueeze(0)  # Start with the initial prompt distribution
         
         for step in range(self.num_tokens):
             # Get logits for the next token
             output = self.model(inputs_embeds=input_embedding, 
-                                attention_mask=attention_mask, 
-                                use_cache=True)  # No sampling, just the logits
+                                attention_mask=attention_mask, )
+                                # use_cache=True)  # No sampling, just the logits
             
             # Extract logits for the current step (this is for the next token)
             logits = output.logits[:, -1, :]  # Get logits for the last token (current step)
 
             # Apply Gumbel Softmax to get the next token probabilities
             token_probs = F.gumbel_softmax(logits, tau=1.0, dim=-1)
-            
-            # Append token probabilities to the generated probabilities
-            generated_probs.append(token_probs.squeeze(0))  # Add the current token probabilities
-
-            # Sample the next token based on the probabilities (for continuity)
-            next_token = token_probs.argmax(dim=-1).unsqueeze(-1)  # Get the token with highest probability
-            
-            # Append the next token to the generated sequence (tokens)
-            generated_tokens.append(next_token.item())
 
             # Update the current sequence by appending the next token's probability distribution
             next_token_prob_dist = token_probs.unsqueeze(0)  # Add batch dimension
-            current_sequence = torch.cat((current_sequence, next_token_prob_dist), dim=1)
+            # current_sequence = torch.cat((current_sequence, next_token_prob_dist), dim=1)
 
             # Update input embedding with the newly generated token using get_weighted_embedding
             input_embedding = torch.cat(
-                (input_embedding, self.get_weighted_embedding(token_probs.unsqueeze(0))), dim=1
+                (input_embedding, self.get_weighted_embedding(next_token_prob_dist)), dim=1
             )  # Concatenate the new token's weighted embedding to the sequence
-        
+            print(f"[Step {step}] token_probs grad_fn:", token_probs.grad_fn)
+            print(f"[Step {step}] new weighted embedding grad_fn:", self.get_weighted_embedding(next_token_prob_dist).grad_fn)
+            print(f"[Step {step}] input_embedding grad_fn:", input_embedding.grad_fn)
+
             
             # Update the attention mask
             attention_mask = torch.cat((attention_mask, torch.ones(1, 1, device=self.device)), dim=1)  # Append 1 to attention mask
 
-        # Decode the generated sequence into text (using token IDs)
-        generated_text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
-
-        # Convert the list of probabilities into a tensor for further analysis or saving
-        generated_probs_tensor = torch.stack(generated_probs, dim=0).to(self.device)  # (1, num_tokens, vocab_size)
-
-        return generated_text, generated_tokens, generated_probs_tensor
+        return input_embedding[:, self.prompt_length:, :]
 
     def forward(self):
         """Computes safety score based on generated responses."""
-        _, _, prob_matrix = self.generate_response(self.prompt_prob_dist)
+        embeddings_matrix = self.generate_response(self.prompt_prob_dist)
         
         # Generate the corresponding attention mask
-        attention_mask = torch.ones(prob_matrix.shape[:2], device=self.device)  # (1, num_tokens)
+        attention_mask = torch.ones(embeddings_matrix.shape[:2], device=self.device)  # (1, num_tokens)
         
-        # Pass both `inputs_embeds` and `attention_mask` to the classifier
-        input_embedding = self.get_weighted_embedding(prob_matrix)  # (1, seq_len, emb_dim)
-        safety_logit = self.classifier(attention_mask=attention_mask, inputs_embeds=input_embedding).squeeze(-1)  # (1, num_tokens, 1)
+        print("embedding_matrix grad_fn:", embeddings_matrix.grad_fn)
+        safety_logit = self.classifier(attention_mask=attention_mask, inputs_embeds=embeddings_matrix).squeeze(-1)  # (1, num_tokens, 1)
+
         # get safety score for backpropagation from a single logit using sigmoid
         safety_score = torch.sigmoid(safety_logit)
+        
+        print("safety_logit grad_fn:", safety_logit.grad_fn)
+        print("safety_score grad_fn:", safety_score.grad_fn)
+        
         return safety_score
 
     def train_step(self):
         """Performs a training step to optimize the prompt distribution."""
+        self.classifier.eval()  # Important: make sure classifier is deterministic
         self.optimizer.zero_grad()
         safety_score = self.forward()
         loss = safety_score  
         loss.backward()
+        print("Grad on prompt_prob_dist:", self.prompt_prob_dist.grad)
         self.optimizer.step()
         return loss.item()
+    
+    
+    # def train_step(self):
+    #     # Initial memory state
+    #     print(f"Start - Allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB, "
+    #         f"Reserved: {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
+
+    #     # Forward pass
+    #     self.optimizer.zero_grad()
+    #     print("Optimizer parameters:")
+    #     for name, param in self.named_parameters():
+    #         if param.requires_grad:
+    #             print(name, param.shape)
+    #     safety_score = self.forward()
+    #     loss = safety_score
+    #     print(f"After forward - Allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB, "
+    #         f"Reserved: {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
+
+    #     # Backward pass
+    #     with profiler.profile(record_shapes=True, use_device='cuda') as prof:
+    #         loss.backward()
+    #     print(f"After backward - Allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB, "
+    #         f"Reserved: {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
+    #     print("Backward pass profile (top 10 by CUDA memory):")
+    #     print(prof.key_averages().table(sort_by="cuda_memory_usage", row_limit=10))
+
+    #     # Check gradients
+    #     grad_size = (self.prompt_prob_dist.grad.element_size() * self.prompt_prob_dist.grad.nelement() / 1024**2
+    #                 if self.prompt_prob_dist.grad is not None else 0)
+    #     print(f"prompt_prob_dist gradient size: {grad_size:.2f} MB")
+
+    #     # Optimizer step and explicit gradient clearing
+    #     self.optimizer.step()
+    #     self.prompt_prob_dist.grad = None  # Force clear gradients
+    #     print(f"After optimizer.step - Allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB, "
+    #         f"Reserved: {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
+    #     print(f"Post-step prompt_prob_dist gradient: {self.prompt_prob_dist.grad}")
+
+    #     # Delete tensors and check references
+    #     loss_value = loss.item()
+    #     del safety_score, loss
+    #     print(f"After del - Allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB, "
+    #         f"Reserved: {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
+
+    #     # Clear cache and collect garbage
+    #     torch.cuda.empty_cache()
+    #     gc.collect()
+    #     print(f"After empty_cache - Allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB, "
+    #         f"Reserved: {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
+
+    #     # Check lingering tensors
+    #     tensors = [obj for obj in gc.get_objects() if torch.is_tensor(obj) and obj.is_cuda and obj.requires_grad]
+    #     if tensors:
+    #         print("Lingering CUDA tensors with requires_grad=True:")
+    #         for t in tensors[:5]:
+    #             print(f" - Size: {t.element_size() * t.nelement() / 1024**2:.2f} MB, Shape: {t.shape}")
+    #             # Optional: Check if tied to prompt_prob_dist
+    #             if t is self.prompt_prob_dist:
+    #                 print("   - This is prompt_prob_dist!")
+    #     else:
+    #         print("No lingering CUDA tensors with requires_grad=True found.")
+
+    #     return loss_value
 
 
 
