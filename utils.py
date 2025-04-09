@@ -196,7 +196,7 @@ class LLMProbabilisticPipeline(nn.Module):
         self.embedding_layer = self.model.get_input_embeddings()
         self.embedding_layer.weight.requires_grad = False
         self.embedding_matrix = self.embedding_layer.weight.to(self.device)
-        self.prompt_logits = nn.Parameter(torch.randn(prompt_length, self.vocab_size, device=self.device))
+        self.prompt_logits = nn.Parameter(torch.ones(prompt_length, self.vocab_size, device=self.device))
         self.lambda_reg = lambda_reg
         
         for param in self.model.parameters():
