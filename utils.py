@@ -195,10 +195,7 @@ class LLMProbabilisticPipeline(nn.Module):
         self.embedding_layer = self.model.get_input_embeddings()
         self.embedding_layer.weight.requires_grad = False
         self.embedding_matrix = self.embedding_layer.weight.to(self.device)
-        # Learnable probability distribution over tokens (Move to device)
-        self.prompt_prob_dist = nn.Parameter(
-            F.gumbel_softmax(torch.randn(prompt_length, self.vocab_size, device=self.device), dim=-1)
-        )
+        self.prompt_logits = nn.Parameter(torch.randn(prompt_length, self.vocab_size, device=self.device))
         
         for param in self.model.parameters():
             param.requires_grad = False
@@ -207,7 +204,7 @@ class LLMProbabilisticPipeline(nn.Module):
         for param in self.classifier.parameters():
             param.requires_grad = False
 
-        self.optimizer = torch.optim.Adam([self.prompt_prob_dist], lr=learning_rate)
+        self.optimizer = torch.optim.Adam([self.prompt_logits], lr=learning_rate)
 
     def get_weighted_embedding(self, prob_dist):
         """Computes the weighted sum of embeddings based on probability distributions."""
@@ -227,7 +224,6 @@ class LLMProbabilisticPipeline(nn.Module):
 
         # Initialize the prompt with the weighted embedding of the initial probability distribution
         weighted_prompt = self.get_weighted_embedding(prompt_prob_dist)
-        print("initial weighted_prompt grad_fn:", weighted_prompt.grad_fn)
         attention_mask = torch.ones(weighted_prompt.shape[:2], device=self.device)  # Mask for attention
         
 
@@ -255,9 +251,6 @@ class LLMProbabilisticPipeline(nn.Module):
             input_embedding = torch.cat(
                 (input_embedding, self.get_weighted_embedding(next_token_prob_dist)), dim=1
             )  # Concatenate the new token's weighted embedding to the sequence
-            print(f"[Step {step}] token_probs grad_fn:", token_probs.grad_fn)
-            print(f"[Step {step}] new weighted embedding grad_fn:", self.get_weighted_embedding(next_token_prob_dist).grad_fn)
-            print(f"[Step {step}] input_embedding grad_fn:", input_embedding.grad_fn)
 
             
             # Update the attention mask
@@ -267,19 +260,16 @@ class LLMProbabilisticPipeline(nn.Module):
 
     def forward(self):
         """Computes safety score based on generated responses."""
+        self.prompt_prob_dist = F.gumbel_softmax(self.prompt_logits, tau=1.0, dim=-1)
         embeddings_matrix = self.generate_response(self.prompt_prob_dist)
         
         # Generate the corresponding attention mask
         attention_mask = torch.ones(embeddings_matrix.shape[:2], device=self.device)  # (1, num_tokens)
         
-        print("embedding_matrix grad_fn:", embeddings_matrix.grad_fn)
         safety_logit = self.classifier(attention_mask=attention_mask, inputs_embeds=embeddings_matrix).squeeze(-1)  # (1, num_tokens, 1)
 
         # get safety score for backpropagation from a single logit using sigmoid
         safety_score = torch.sigmoid(safety_logit)
-        
-        print("safety_logit grad_fn:", safety_logit.grad_fn)
-        print("safety_score grad_fn:", safety_score.grad_fn)
         
         return safety_score
 
@@ -290,7 +280,6 @@ class LLMProbabilisticPipeline(nn.Module):
         safety_score = self.forward()
         loss = safety_score  
         loss.backward()
-        print("Grad on prompt_prob_dist:", self.prompt_prob_dist.grad)
         self.optimizer.step()
         return loss.item()
     
