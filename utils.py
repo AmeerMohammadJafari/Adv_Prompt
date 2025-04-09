@@ -179,7 +179,8 @@ def download_dataset(base_path, splits, directory_name):
         
 
 class LLMProbabilisticPipeline(nn.Module):
-    def __init__(self, model_name, prompt_length, num_tokens, classifier, learning_rate=1e-2):
+    def __init__(self, model_name, prompt_length, num_tokens, classifier, learning_rate=1e-2, lambda_reg=1e-2
+):
         super().__init__()
         
         # Set device
@@ -196,6 +197,7 @@ class LLMProbabilisticPipeline(nn.Module):
         self.embedding_layer.weight.requires_grad = False
         self.embedding_matrix = self.embedding_layer.weight.to(self.device)
         self.prompt_logits = nn.Parameter(torch.randn(prompt_length, self.vocab_size, device=self.device))
+        self.lambda_reg = lambda_reg
         
         for param in self.model.parameters():
             param.requires_grad = False
@@ -226,16 +228,13 @@ class LLMProbabilisticPipeline(nn.Module):
         weighted_prompt = self.get_weighted_embedding(prompt_prob_dist)
         attention_mask = torch.ones(weighted_prompt.shape[:2], device=self.device)  # Mask for attention
         
-
-        
         # Initial input embeddings for the first token
         input_embedding = weighted_prompt
         
         for step in range(self.num_tokens):
             # Get logits for the next token
             output = self.model(inputs_embeds=input_embedding, 
-                                attention_mask=attention_mask, )
-                                # use_cache=True)  # No sampling, just the logits
+                                attention_mask=attention_mask)  # No sampling, just the logits
             
             # Extract logits for the current step (this is for the next token)
             logits = output.logits[:, -1, :]  # Get logits for the last token (current step)
@@ -245,14 +244,12 @@ class LLMProbabilisticPipeline(nn.Module):
 
             # Update the current sequence by appending the next token's probability distribution
             next_token_prob_dist = token_probs.unsqueeze(0)  # Add batch dimension
-            # current_sequence = torch.cat((current_sequence, next_token_prob_dist), dim=1)
 
             # Update input embedding with the newly generated token using get_weighted_embedding
             input_embedding = torch.cat(
                 (input_embedding, self.get_weighted_embedding(next_token_prob_dist)), dim=1
             )  # Concatenate the new token's weighted embedding to the sequence
 
-            
             # Update the attention mask
             attention_mask = torch.cat((attention_mask, torch.ones(1, 1, device=self.device)), dim=1)  # Append 1 to attention mask
 
@@ -277,11 +274,24 @@ class LLMProbabilisticPipeline(nn.Module):
         """Performs a training step to optimize the prompt distribution."""
         self.classifier.eval()  # Important: make sure classifier is deterministic
         self.optimizer.zero_grad()
+        
+        # Compute safety score
         safety_score = self.forward()
-        loss = safety_score  
+        
+        # Compute the uniform distribution for the regularizer
+        uniform_dist = torch.ones_like(self.prompt_prob_dist) / self.vocab_size  # (prompt_length, vocab_size)
+        
+        # Compute dot product with uniform distribution
+        dot_product = torch.sum(self.prompt_prob_dist * uniform_dist)  # Scalar value representing the similarity with uniform distribution
+
+        # Loss function with added regularization term
+        loss = safety_score + self.lambda_reg * dot_product
+        
         loss.backward()
         self.optimizer.step()
+        
         return loss.item()
+
     
     
     # def train_step(self):
