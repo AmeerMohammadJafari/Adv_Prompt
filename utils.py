@@ -179,7 +179,7 @@ def download_dataset(base_path, splits, directory_name):
         
 
 class LLMProbabilisticPipeline(nn.Module):
-    def __init__(self, model_name, prompt_length, num_tokens, classifier, learning_rate=1e-2, lambda_reg=1e-2
+    def __init__(self, model_name, prompt_length, num_tokens, classifier, learning_rate=1e-2, lambda_reg=0
 ):
         super().__init__()
         
