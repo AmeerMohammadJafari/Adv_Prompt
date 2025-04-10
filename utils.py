@@ -179,7 +179,7 @@ def download_dataset(base_path, splits, directory_name):
         
 
 class LLMProbabilisticPipeline(nn.Module):
-    def __init__(self, model_name, prompt_length, num_tokens, classifier, learning_rate=1e-2, lambda_reg=0
+    def __init__(self, model_name, prompt_length, num_tokens, classifier, learning_rate=1e-2, lambda_reg=1e-2, lambda_lm = 1e-2,
 ):
         super().__init__()
         
@@ -198,6 +198,7 @@ class LLMProbabilisticPipeline(nn.Module):
         self.embedding_matrix = self.embedding_layer.weight.to(self.device)
         self.prompt_logits = nn.Parameter(torch.ones(prompt_length, self.vocab_size, device=self.device))
         self.lambda_reg = lambda_reg
+        self.lambda_lm = lambda_lm
         
         for param in self.model.parameters():
             param.requires_grad = False
@@ -254,6 +255,36 @@ class LLMProbabilisticPipeline(nn.Module):
             attention_mask = torch.cat((attention_mask, torch.ones(1, 1, device=self.device)), dim=1)  # Append 1 to attention mask
 
         return input_embedding[:, self.prompt_length:, :]
+    
+    
+    def compute_lm_alignment_loss(self):
+        """
+        Computes -σ(x) · log(P_LM(x)) over the prompt distribution.
+        Encourages soft prompts to look like natural language.
+        """
+        prompt_prob_dist = self.prompt_prob_dist.detach()  # Shape: (prompt_len, vocab_size)
+
+        # Get the weighted embeddings for soft prompts
+        prompt_embeds = self.get_weighted_embedding(prompt_prob_dist)
+
+        attention_mask = torch.ones(prompt_embeds.shape[:2], device=self.device)  # (1, prompt_len)
+
+        # Get model predictions for each prompt token
+        with torch.no_grad():
+            outputs = self.model(inputs_embeds=prompt_embeds, attention_mask=attention_mask)
+            lm_logits = outputs.logits[:, :-1, :]  # Logits for predicting tokens 1..n-1
+            log_probs = torch.log_softmax(lm_logits, dim=-1)  # Convert to log-probs
+
+        # Shift prompt_prob_dist to align with targets (tokens at t=1 to t=n-1)
+        prob_dist_shifted = prompt_prob_dist[1:]  # (prompt_len - 1, vocab_size)
+
+        # Align dimensions for batch processing
+        log_probs = log_probs[0]  # Remove batch dimension: (prompt_len - 1, vocab_size)
+
+        # Compute cross-entropy between soft prompt distribution and LM log probs
+        ce_loss = -torch.sum(prob_dist_shifted * log_probs)
+
+        return ce_loss
 
     def forward(self):
         """Computes safety score based on generated responses."""
@@ -283,9 +314,9 @@ class LLMProbabilisticPipeline(nn.Module):
         
         # Compute dot product with uniform distribution
         dot_product = torch.sum(self.prompt_prob_dist * uniform_dist)  # Scalar value representing the similarity with uniform distribution
-
+        lm_ce_loss = self.compute_lm_alignment_loss()
         # Loss function with added regularization term
-        loss = safety_score + self.lambda_reg * dot_product
+        loss = safety_score + self.lambda_reg * dot_product + self.lambda_lm * lm_ce_loss
         
         loss.backward()
         self.optimizer.step()
